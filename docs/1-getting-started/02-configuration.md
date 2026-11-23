@@ -84,6 +84,12 @@ catalog:
   database: my_db                       # Glue database name
   region: us-west-2                     # AWS region (defaults to storage.region)
   endpoint: ""                          # optional custom endpoint (LocalStack / testing)
+
+partitions:                             # opt-in: business-date (Hive) partitioning
+  date_column: order_date               # default business-date column for all tables
+  tables:                               # per-table override; "" disables for that table
+    public.events: event_date
+    public.legacy_events: ""
 ```
 
 ## Sections
@@ -158,6 +164,17 @@ Optional metadata-catalog integration. When `type: glue`, `pg-cdc init` and `pg-
 | `endpoint` | No | | Custom endpoint (LocalStack / testing) |
 
 For Layer-2 tag governance (required-tag enforcement, column-level overrides, Lake Formation reconciliation), see the [commercial edition](commercial-edition.md).
+
+### partitions
+
+Opt-in Hive-style partitioning by a business-date column. When a table resolves to a date column that exists in its schema, its base and delta files are written under `<col>=YYYY-MM-DD/` directories instead of the flat `base/` and `deltas/` directories, so a consumer (DuckDB, Spark, Athena, Glue) can prune to two dates without scanning the table.
+
+| Field | Required | Default | Description |
+|-------|----------|---------|-------------|
+| `date_column` | No | `""` | Default business-date column. Empty ⇒ no partitioning. |
+| `tables` | No | `{}` | Per-table override. A key present with `""` disables partitioning for that table. |
+
+A configured column only takes effect for a table whose schema actually contains it — a typo or a column that was later dropped degrades to the unpartitioned layout rather than writing rows under a bogus partition. See [Streaming → Partitioning](../2-streaming-and-storage/04-streaming.md#business-date-partitioning).
 
 ## Example Configurations
 

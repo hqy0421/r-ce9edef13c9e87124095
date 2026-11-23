@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -11,6 +12,8 @@ import (
 	gluetypes "github.com/aws/aws-sdk-go-v2/service/glue/types"
 
 	"github.com/burnside-project/burnside-go/manifest"
+
+	"github.com/burnside-project/pg-cdc-core/internal/partition"
 )
 
 // tableAPI is the subset of the Glue client used during registration.
@@ -18,6 +21,7 @@ import (
 type tableAPI interface {
 	CreateTable(ctx context.Context, in *awsglue.CreateTableInput, opts ...func(*awsglue.Options)) (*awsglue.CreateTableOutput, error)
 	UpdateTable(ctx context.Context, in *awsglue.UpdateTableInput, opts ...func(*awsglue.Options)) (*awsglue.UpdateTableOutput, error)
+	BatchCreatePartition(ctx context.Context, in *awsglue.BatchCreatePartitionInput, opts ...func(*awsglue.Options)) (*awsglue.BatchCreatePartitionOutput, error)
 }
 
 // Register catalogues every active table in the manifest. CreateTable is
@@ -40,7 +44,14 @@ func register(ctx context.Context, api tableAPI, database string, m *manifest.Ma
 		return fmt.Errorf("glue: locationFor is nil")
 	}
 
-	for qualified, mt := range m.Tables {
+	names := make([]string, 0, len(m.Tables))
+	for qualified := range m.Tables {
+		names = append(names, qualified)
+	}
+	sort.Strings(names)
+
+	for _, qualified := range names {
+		mt := m.Tables[qualified]
 		if mt.Status != "active" {
 			continue
 		}
@@ -49,7 +60,8 @@ func register(ctx context.Context, api tableAPI, database string, m *manifest.Ma
 			return fmt.Errorf("glue: no schema entry for %q", qualified)
 		}
 
-		input, err := tableInput(qualified, mt, ms, locationFor(qualified))
+		location := locationFor(qualified)
+		input, err := tableInput(qualified, mt, ms, location)
 		if err != nil {
 			return err
 		}
@@ -57,6 +69,43 @@ func register(ctx context.Context, api tableAPI, database string, m *manifest.Ma
 		if err := upsert(ctx, api, database, input); err != nil {
 			return fmt.Errorf("glue: register %s: %w", qualified, err)
 		}
+
+		state := partition.ParseState(mt.Partition)
+		if err := registerPartitions(ctx, api, database, *input.Name, location, input.StorageDescriptor, state); err != nil {
+			return fmt.Errorf("glue: register partitions for %s: %w", qualified, err)
+		}
+	}
+	return nil
+}
+
+// registerPartitions declares each landed partition on the table. It is
+// idempotent: Glue reports AlreadyExists per partition, which is ignored, so a
+// re-run after a new date appears only creates the new ones.
+func registerPartitions(ctx context.Context, api tableAPI, database, tableName, location string, sd *gluetypes.StorageDescriptor, state partition.State) error {
+	inputs := partitionInputs(location, sd, state)
+	if len(inputs) == 0 {
+		return nil
+	}
+	out, err := api.BatchCreatePartition(ctx, &awsglue.BatchCreatePartitionInput{
+		DatabaseName:       aws.String(database),
+		TableName:          aws.String(tableName),
+		PartitionInputList: inputs,
+	})
+	if err != nil {
+		var alreadyExists *gluetypes.AlreadyExistsException
+		if errors.As(err, &alreadyExists) || strings.Contains(err.Error(), "AlreadyExistsException") {
+			return nil
+		}
+		return err
+	}
+	for _, pe := range out.Errors {
+		if pe.ErrorDetail == nil {
+			continue
+		}
+		if code := aws.ToString(pe.ErrorDetail.ErrorCode); strings.Contains(code, "AlreadyExists") {
+			continue
+		}
+		return fmt.Errorf("partition %v: %s: %s", pe.PartitionValues, aws.ToString(pe.ErrorDetail.ErrorCode), aws.ToString(pe.ErrorDetail.ErrorMessage))
 	}
 	return nil
 }

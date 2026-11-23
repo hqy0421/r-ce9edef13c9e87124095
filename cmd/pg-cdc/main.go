@@ -166,7 +166,7 @@ func compactCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			return internal.Compact(cmd.Context(), sink)
+			return internal.Compact(cmd.Context(), cfg, sink)
 		},
 	}
 }

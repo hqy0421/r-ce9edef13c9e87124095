@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+
+	"github.com/burnside-project/pg-cdc-core/internal/partition"
 )
 
 type tool struct {
@@ -107,6 +109,9 @@ func (s *server) listTables(ctx context.Context) map[string]any {
 		t := active[n]
 		fmt.Fprintf(&b, "- %s · rows=%d · base_epoch=%d · latest_delta=%d",
 			n, t.RowCount, t.BaseEpoch, t.LatestDeltaEpoch)
+		if state := partition.ParseState(t.Partition); state.Column != "" {
+			fmt.Fprintf(&b, " · partitions=%d (%s)", len(state.Partitions), state.Column)
+		}
 		if len(t.Tags) > 0 {
 			fmt.Fprintf(&b, " · tags=[%s]", strings.Join(t.Tags, ","))
 		}

@@ -79,6 +79,7 @@ A feature-by-feature catalog. The exhaustive, link-rich version lives in [`docs/
 | **Streaming WAL → delta Parquet** | `start` daemon buffers events and flushes typed Parquet per table on interval / row / **byte** budget. Per-table parallel flush. |
 | **Schema evolution** | Detects `ADD/DROP COLUMN`, propagates to manifest + Glue + Iceberg live — no restart. `reconcile --table` one-shot for hot tables. |
 | **Compaction** | `compact` merges delta epochs into a new base, applies I/U/D, soft-deletes on a tombstone TTL. CAS-safe alongside the live streamer. |
+| **Business-date partitioning** | Opt-in Hive layout (`partitions.date_column`): rows land under `<col>=YYYY-MM-DD/` for partition-pruned queries; an `UPDATE` can move a row to a new date, and compaction leaves no copy in the old date. NULL dates go to the registered `__HIVE_DEFAULT_PARTITION__`. |
 | **TOAST partial-row preservation** | Honors `TupleDataType 'u'` — unchanged TOAST columns keep their value instead of silently becoming NULL. |
 | **Versioned manifest** | A single JSON source of truth (active tables, schema versions, epoch markers, source LSN), CAS-committed on S3. |
 
@@ -87,7 +88,7 @@ A feature-by-feature catalog. The exhaustive, link-rich version lives in [`docs/
 | Capability | What it does |
 | --- | --- |
 | **Apache Iceberg writer** | `catalog.type: iceberg` — every flush is an Iceberg snapshot; in-tree schema evolution + background snapshot expiration (default retain 100/table). |
-| **Hive/Parquet on Glue** | `catalog.type: glue` — register active tables so Athena / Spark / DuckDB read the Parquet directly. |
+| **Hive/Parquet on Glue** | `catalog.type: glue` — register active tables so Athena / Spark / DuckDB read the Parquet directly. Partitioned tables get the date declared as a Glue `PartitionKey` plus one registration per landed date (incl. the default partition). |
 | **S3 sink** | Multipart upload (aws-sdk-go-v2 transfer manager), SDK retry middleware, S3-compatible endpoints (MinIO, R2). Configurable `bucket`/`prefix`/`region`/`endpoint`. |
 | **Filesystem sink** | Zero-dependency local output for dev / on-prem / air-gapped. _(GCS sink is a scaffolded stub — not implemented.)_ |
 | **Time-travel refs** | `refs.json`: `staging` advances every flush, `main` advances by `promotion.mode` (auto/manual), immutable `raw@<ts>` tags per flush. Git-shaped consumer workflow via `promote`. |

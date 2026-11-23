@@ -119,6 +119,11 @@ When conflicts fire faster than ~1/hour — typically two `pg-cdc start` process
 
 Compaction (PR #132) writes the manifest **before** deleting its old delta files — a per-table CAS commit gates the delete. A crash anywhere before that gate leaves the old base + deltas authoritative and the next compact replays from the same `BaseEpoch`. Pre-fix the loop persisted the manifest once at the end of all tables, so a per-table delete that completed before the trailing write silently lost data on crash.
 
+Partitioned tables follow the same order and add two safety nets:
+
+- **Generation GC is idempotent.** After the manifest commit, compaction deletes every base file whose generation (`base_<N>`) differs from the new `base_epoch`, plus the base of any partition that no longer holds a live row. A crash mid-delete leaves extra files, which the next run removes; readers select only the manifest's `BaseEpoch` generation, so stale files are never read.
+- **A moved row is never in two partitions' live bases.** Compaction indexes by primary key across all partitions and re-buckets the surviving rows, so after the manifest commit only the destination partition's new base carries the row. Before the commit the old generation's bases are still authoritative, so a crash leaves the pre-move state fully readable.
+
 ## Verified scenarios
 
 The unit chaos suite (`internal/chaos_test.go`) exercises the durability boundary against an in-memory fake sink with injected failures. Each test asserts the at-least-once contract holds without a real Postgres or sink.

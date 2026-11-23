@@ -15,6 +15,7 @@ import (
 
 	"github.com/burnside-project/pg-cdc-core/internal/config"
 	"github.com/burnside-project/pg-cdc-core/internal/glue"
+	"github.com/burnside-project/pg-cdc-core/internal/layout"
 	"github.com/burnside-project/pg-cdc-core/internal/ports"
 	"github.com/burnside-project/pg-cdc-core/internal/tags"
 	"github.com/burnside-project/pg-cdc-core/internal/writer"
@@ -137,20 +138,31 @@ func Init(ctx context.Context, cfg config.Config, source ports.Source, sink port
 				Nullable:    col.Nullable,
 			})
 		}
+		tableSchema := manifest.Schema{Version: 1, Columns: mCols}
+		spec := partitionSpecFor(cfg, t.qualified, tableSchema)
 
-		// Write base Parquet
-		basePath := filepath.Join(t.qualified, "base", "base_000000.parquet")
-		tmpPath := filepath.Join("/tmp", "pgcdc-init", basePath)
-		if err := writer.WriteBaseParquet(tmpPath, rows, mCols); err != nil {
-			fmt.Printf(" (parquet write failed: %v, writing raw)\n", err)
+		// Write one base file per business-date partition (or a single base in
+		// the legacy layout when the table is not partitioned).
+		groups := layout.GroupByPartition(spec, rows)
+		observed := make(map[string]int64, len(groups))
+		omit := omitSet(spec)
+		for _, dir := range layout.SortedDirs(groups) {
+			basePath := layout.BasePath(t.qualified, dir, 0)
+			tmpPath := filepath.Join("/tmp", "pgcdc-init", basePath)
+			if err := writer.WriteBaseParquetOpts(tmpPath, groups[dir], mCols, writer.BaseOptions{Omit: omit}); err != nil {
+				fmt.Printf(" (parquet write failed: %v, writing raw)\n", err)
+			}
+			if err := uploadFile(ctx, sink, basePath, tmpPath); err != nil {
+				return fmt.Errorf("upload %s: %w", basePath, err)
+			}
+			observed[dir] = int64(len(groups[dir]))
 		}
 
-		// Upload to storage via sink
-		if err := uploadFile(ctx, sink, basePath, tmpPath); err != nil {
-			return fmt.Errorf("upload %s: %w", basePath, err)
+		if spec.Enabled() {
+			fmt.Printf(" %d rows across %d partitions\n", len(rows), len(groups))
+		} else {
+			fmt.Printf(" %d rows\n", len(rows))
 		}
-
-		fmt.Printf(" %d rows\n", len(rows))
 
 		manifestTables[t.qualified] = manifest.Table{
 			Status:           "active",
@@ -162,9 +174,10 @@ func Init(ctx context.Context, cfg config.Config, source ports.Source, sink port
 			RowCount:         int64(len(rows)),
 			Path:             t.qualified,
 		}
-		manifestSchemas[t.qualified] = manifest.Schema{
-			Version: 1,
-			Columns: mCols,
+		manifestSchemas[t.qualified] = tableSchema
+
+		if spec.Enabled() {
+			recordPartitions(manifestTables, t.qualified, spec.Column, observed)
 		}
 	}
 

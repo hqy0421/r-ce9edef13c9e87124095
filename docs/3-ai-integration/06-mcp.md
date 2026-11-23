@@ -88,7 +88,7 @@ The server exposes four tools. The LLM picks which to call based on the user's q
 
 ### `list_tables`
 
-Lists all active tables from the manifest with row counts, tags, and epoch state.
+Lists all active tables from the manifest with row counts, tags, epoch state, and — for partitioned tables — the partition count and date column.
 
 **Arguments:** none.
 
@@ -99,7 +99,7 @@ Lists all active tables from the manifest with row counts, tags, and epoch state
 3 active tables (sink: filesystem)
 
 - public.customers · rows=1240 · base_epoch=0 · latest_delta=12 · tags=[pii]
-- public.orders    · rows=58302 · base_epoch=15 · latest_delta=42
+- public.orders    · rows=58302 · base_epoch=15 · latest_delta=42 · partitions=6 (order_date)
 - public.products  · rows=189 · base_epoch=0 · latest_delta=3
 ```
 
@@ -139,6 +139,10 @@ Runs a read-only `SELECT` against the Parquet output (base + deltas combined). T
 
 **Backed by:** DuckDB CLI subprocess. Statement timeout: 15 seconds.
 
+**Live files only.** Each view reads the table's current base-generation files plus deltas newer than the base epoch — never superseded generations or already-applied deltas — so results stay correct during and after compaction.
+
+**Partitioned tables.** The business-date column is reconstructed from the `<col>=<value>` directories (DuckDB `hive_partitioning`), so it is queryable and prune-able like any other column (`WHERE order_date IN (DATE '2026-01-01', DATE '2026-01-02')` only reads those two partitions). Rows in `__HIVE_DEFAULT_PARTITION__` return `NULL` for the date.
+
 **Validation:** the SQL must start with `SELECT` or `WITH`. Statements containing `INSERT`, `UPDATE`, `DELETE`, `DROP`, `ALTER`, `CREATE`, `ATTACH`, `COPY`, `PRAGMA`, or `LOAD` are rejected before reaching DuckDB.
 
 **Example invocation (the LLM constructs this):**
@@ -162,7 +166,7 @@ Returns rows from the *streaming delta files only* — i.e. changes that have ar
 | `name` | string | yes | Fully-qualified table name |
 | `limit` | integer | no | Max rows — default `20`, max `200` |
 
-**Backed by:** DuckDB CLI subprocess.
+**Backed by:** DuckDB CLI subprocess. Reads only the delta files still on disk (compaction deletes the ones it has folded into a base), across both the flat and per-date layouts; for partitioned tables the date column is reconstructed from the directory.
 
 If no deltas have been written yet (e.g. you just ran `init` and haven't streamed anything), the tool returns a friendly *"no streaming changes recorded yet"* message rather than an error.
 

@@ -13,6 +13,8 @@ import (
 	btypes "github.com/burnside-project/burnside-go/types"
 
 	"github.com/burnside-project/pg-cdc-core/internal/config"
+	"github.com/burnside-project/pg-cdc-core/internal/layout"
+	"github.com/burnside-project/pg-cdc-core/internal/partition"
 	"github.com/burnside-project/pg-cdc-core/internal/ports"
 	"github.com/burnside-project/pg-cdc-core/internal/writer"
 )
@@ -61,6 +63,7 @@ func Start(ctx context.Context, cfg config.Config, source ports.Source, sink por
 
 	// Buffer and flush
 	buffer := &eventBuffer{
+		cfg:      cfg,
 		source:   source,
 		sink:     sink,
 		manifest: m,
@@ -107,6 +110,7 @@ func Start(ctx context.Context, cfg config.Config, source ports.Source, sink por
 
 // eventBuffer collects CDC events and flushes them as epoch Parquet files.
 type eventBuffer struct {
+	cfg      config.Config
 	source   ports.Source
 	sink     ports.Sink
 	manifest *manifest.Manifest
@@ -211,11 +215,17 @@ func (b *eventBuffer) flush(ctx context.Context) error {
 		byTable[evt.Table] = append(byTable[evt.Table], evt)
 	}
 
-	// Determine next epoch number
+	// Determine next epoch number. BaseEpoch is included so a table whose base
+	// has advanced past its latest delta (e.g. after a legacy→partitioned
+	// migration with no new deltas) still gets a strictly newer epoch, which
+	// compaction will then apply.
 	var maxEpoch int64
 	for _, t := range b.manifest.Tables {
 		if t.LatestDeltaEpoch > maxEpoch {
 			maxEpoch = t.LatestDeltaEpoch
+		}
+		if t.BaseEpoch > maxEpoch {
+			maxEpoch = t.BaseEpoch
 		}
 	}
 	nextEpoch := maxEpoch + 1
@@ -251,17 +261,38 @@ func (b *eventBuffer) flush(ctx context.Context) error {
 			continue
 		}
 
-		// Write to temp, then upload
-		deltaFilename := epoch.FormatFilename(nextEpoch)
-		remotePath := filepath.Join(table.Path, "deltas", deltaFilename)
-		tmpPath := filepath.Join("/tmp", "pgcdc-stream", remotePath)
-
-		if err := writer.WriteDeltaParquet(tmpPath, rows, schema.Columns, nextEpoch); err != nil {
-			return fmt.Errorf("write delta for %s: %w", tableName, err)
+		// Resolve the business-date partition column. A table becomes
+		// partitioned if it is configured as such (or was already recorded as
+		// partitioned at init).
+		spec := partitionSpecFor(b.cfg, tableName, schema)
+		if !spec.Enabled() {
+			spec = partition.ParseState(table.Partition).Spec()
 		}
 
-		if err := uploadFile(ctx, b.sink, remotePath, tmpPath); err != nil {
-			return fmt.Errorf("upload delta for %s: %w", tableName, err)
+		// Bucket this flush's events by partition and write one delta file per
+		// non-empty partition under the shared epoch number.
+		groups := layout.GroupByPartition(spec, rows)
+		deltaFilename := epoch.FormatFilename(nextEpoch)
+		omit := omitSet(spec)
+
+		var seq int64
+		for _, dir := range layout.SortedDirs(groups) {
+			groupRows := groups[dir]
+			// Assign a global __seq so compaction can order events across
+			// partitions deterministically.
+			for _, row := range groupRows {
+				row[writer.ColSeq] = seq
+				seq++
+			}
+			remotePath := layout.DeltaPath(table.Path, dir, deltaFilename)
+			tmpPath := filepath.Join("/tmp", "pgcdc-stream", remotePath)
+
+			if err := writer.WriteDeltaParquetOpts(tmpPath, groupRows, schema.Columns, nextEpoch, writer.DeltaOptions{Omit: omit}); err != nil {
+				return fmt.Errorf("write delta for %s [%s]: %w", tableName, dir, err)
+			}
+			if err := uploadFile(ctx, b.sink, remotePath, tmpPath); err != nil {
+				return fmt.Errorf("upload delta for %s [%s]: %w", tableName, dir, err)
+			}
 		}
 
 		// Update manifest
@@ -269,6 +300,18 @@ func (b *eventBuffer) flush(ctx context.Context) error {
 		t.LatestDeltaEpoch = nextEpoch
 		b.manifest.Tables[tableName] = t
 		b.tables[tableName] = t
+
+		// The manifest partition list reflects the actual landing locations.
+		if spec.Enabled() {
+			observed := existingPartitionDirs(b.manifest, tableName)
+			for _, dir := range layout.SortedDirs(groups) {
+				if _, ok := observed[dir]; !ok {
+					observed[dir] = 0
+				}
+			}
+			mutatePartitionState(b.manifest, tableName, spec.Column, observed)
+			b.tables[tableName] = b.manifest.Tables[tableName]
+		}
 
 		fmt.Printf("  epoch %d: %s (%d events)\n", nextEpoch, tableName, len(tableEvents))
 	}

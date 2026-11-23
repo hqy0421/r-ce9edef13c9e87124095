@@ -288,3 +288,102 @@ func TestWriteDeltaParquet(t *testing.T) {
 		t.Error("missing id column")
 	}
 }
+
+func parquetColumnNames(t *testing.T, path string) map[string]bool {
+	t.Helper()
+	f, err := os.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = f.Close() }()
+	stat, _ := f.Stat()
+	pf, err := goparquet.OpenFile(f, stat.Size())
+	if err != nil {
+		t.Fatalf("open parquet: %v", err)
+	}
+	names := make(map[string]bool)
+	for _, field := range pf.Schema().Fields() {
+		names[field.Name()] = true
+	}
+	return names
+}
+
+func TestWriteDeltaParquet_Seq(t *testing.T) {
+	dir := t.TempDir()
+	columns := []manifest.Column{{Name: "id", PgType: "bigint", ParquetType: "INT64"}}
+
+	withSeq := filepath.Join(dir, "with_seq.parquet")
+	rows := []Row{{"__op": "I", "id": int64(1)}, {"__op": "I", "id": int64(2)}}
+	if err := WriteDeltaParquet(withSeq, rows, columns, 1); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if !parquetColumnNames(t, withSeq)["__seq"] {
+		t.Error("__seq column missing by default")
+	}
+	if got := rows[1]["__seq"]; got != int64(1) {
+		t.Errorf("__seq auto-injected = %v, want 1", got)
+	}
+
+	noSeq := filepath.Join(dir, "no_seq.parquet")
+	if err := WriteDeltaParquetOpts(noSeq, []Row{{"__op": "I", "id": int64(1)}}, columns, 1, DeltaOptions{NoSeq: true}); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if parquetColumnNames(t, noSeq)["__seq"] {
+		t.Error("__seq column present despite NoSeq")
+	}
+
+	// A caller-supplied __seq is preserved, not overwritten.
+	kept := filepath.Join(dir, "kept.parquet")
+	rows2 := []Row{{"__op": "I", "id": int64(1), "__seq": int64(42)}}
+	if err := WriteDeltaParquet(kept, rows2, columns, 1); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if got := rows2[0]["__seq"]; got != int64(42) {
+		t.Errorf("explicit __seq overwritten: %v", got)
+	}
+}
+
+func TestWriteBaseParquet_OmitPartitionColumn(t *testing.T) {
+	dir := t.TempDir()
+	columns := []manifest.Column{
+		{Name: "id", PgType: "bigint", ParquetType: "INT64"},
+		{Name: "order_date", PgType: "date", ParquetType: "DATE", Nullable: true},
+	}
+	path := filepath.Join(dir, "base.parquet")
+	if err := WriteBaseParquetOpts(path, []Row{{"id": int64(1), "order_date": "2026-01-01"}},
+		columns, BaseOptions{Omit: map[string]bool{"order_date": true}}); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	names := parquetColumnNames(t, path)
+	if names["order_date"] {
+		t.Error("partition column should be omitted from the file")
+	}
+	if !names["id"] {
+		t.Error("data column missing")
+	}
+}
+
+func TestWriteBaseParquet_Tombstones(t *testing.T) {
+	dir := t.TempDir()
+	columns := []manifest.Column{{Name: "id", PgType: "bigint", ParquetType: "INT64"}}
+	rows := []Row{
+		{"id": int64(1), "__deleted_at": "2026-04-12T14:00:00Z"},
+		{"id": int64(2)},
+	}
+
+	plain := filepath.Join(dir, "plain.parquet")
+	if err := WriteBaseParquet(plain, rows, columns); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if parquetColumnNames(t, plain)["__deleted_at"] {
+		t.Error("tombstone column written without the option")
+	}
+
+	withTomb := filepath.Join(dir, "tomb.parquet")
+	if err := WriteBaseParquetOpts(withTomb, rows, columns, BaseOptions{Tombstones: true}); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if !parquetColumnNames(t, withTomb)["__deleted_at"] {
+		t.Error("tombstone column missing when requested")
+	}
+}

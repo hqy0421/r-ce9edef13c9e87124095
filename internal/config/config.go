@@ -11,6 +11,7 @@ type Config struct {
 	Profiles    ProfilesConfig    `yaml:"profiles"`
 	State       StateConfig       `yaml:"state"`
 	Catalog     CatalogConfig     `yaml:"catalog"`
+	Partitions  PartitionsConfig  `yaml:"partitions"`
 }
 
 // SourceConfig holds the database source settings.
@@ -85,6 +86,26 @@ type CatalogConfig struct {
 	Database string `yaml:"database"` // glue: database name
 	Region   string `yaml:"region"`   // glue: AWS region (defaults to Storage.Region)
 	Endpoint string `yaml:"endpoint"` // glue: custom endpoint (LocalStack / testing)
+}
+
+// PartitionsConfig selects a Hive business-date partition column per table.
+// When DateColumn is empty and no per-table override applies, tables keep the
+// legacy unpartitioned layout.
+type PartitionsConfig struct {
+	DateColumn string            `yaml:"date_column"` // default business-date column
+	Tables     map[string]string `yaml:"tables"`      // per-table override; "" disables
+}
+
+// ColumnFor returns the configured business-date column for a table. A
+// per-table entry wins (an explicit "" disables partitioning for that table);
+// otherwise the default DateColumn applies.
+func (p PartitionsConfig) ColumnFor(table string) string {
+	if p.Tables != nil {
+		if col, ok := p.Tables[table]; ok {
+			return col
+		}
+	}
+	return p.DateColumn
 }
 
 // StorageType returns the resolved storage type, defaulting to "filesystem".

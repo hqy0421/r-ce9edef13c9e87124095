@@ -26,8 +26,9 @@ Use this when you've enabled catalog.type on a deployment that was previously
 snapshotted without it — running init again would re-snapshot every table
 from Postgres and duplicate the parquet base files in S3.
 
-Safe to re-run: registration is upsert semantics (CreateTable falls through
-to UpdateTable on the second attempt).`,
+Safe to re-run: table registration is upsert semantics (CreateTable falls
+through to UpdateTable on the second attempt), and Glue partitions are created
+idempotently so an existing partition list is preserved.`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			cfg, err := loadConfig()
 			if err != nil {

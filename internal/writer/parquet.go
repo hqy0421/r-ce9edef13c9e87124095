@@ -20,18 +20,63 @@ import (
 // Row is a generic row type for Parquet writing.
 type Row = map[string]any
 
+// ColSeq is the per-flush event ordinal stored in delta files. It preserves the
+// source order of events that share one epoch, so compaction can apply several
+// changes to the same primary key deterministically (including an update that
+// moves a row between business-date partitions).
+const ColSeq = "__seq"
+
+// isMetaColumn reports whether name is one of the CDC bookkeeping columns that
+// are managed by this package rather than read from the source row.
+func isMetaColumn(name string) bool {
+	switch name {
+	case btypes.ColOp, btypes.ColEpoch, btypes.ColDeletedAt, ColSeq:
+		return true
+	}
+	return false
+}
+
+// BaseOptions tunes base-file writing.
+type BaseOptions struct {
+	// Omit lists columns to leave out of the file (e.g. a Hive partition
+	// column, whose value is encoded in the directory instead).
+	Omit map[string]bool
+	// Tombstones adds a nullable __deleted_at column. Without it a base file
+	// would silently drop the delete markers that compaction is meant to
+	// preserve for downstream consumers.
+	Tombstones bool
+}
+
+// DeltaOptions tunes delta-file writing.
+type DeltaOptions struct {
+	// Omit lists source columns to leave out of the file.
+	Omit map[string]bool
+	// Seq enables the __seq column and injects each row's position in the
+	// slice. Defaults on; set NoSeq to suppress it.
+	NoSeq bool
+}
+
 // WriteBaseParquet writes rows to a base Parquet file using parquet-go.
 // All values are written as strings/bytes for simplicity in v0.1.
 // Downstream consumers (pg-warehouse) handle type coercion via DuckDB's read_parquet.
 func WriteBaseParquet(path string, rows []Row, columns []manifest.Column) error {
+	return WriteBaseParquetOpts(path, rows, columns, BaseOptions{})
+}
+
+// WriteBaseParquetOpts is WriteBaseParquet with column omission.
+func WriteBaseParquetOpts(path string, rows []Row, columns []manifest.Column, opts BaseOptions) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
 		return fmt.Errorf("create directory: %w", err)
 	}
 
-	// Filter out CDC metadata columns
 	var dataCols []manifest.Column
+	if opts.Tombstones {
+		dataCols = append(dataCols, manifest.Column{
+			Name: btypes.ColDeletedAt, PgType: "text", ParquetType: "UTF8", Nullable: true,
+		})
+	}
 	for _, col := range columns {
-		if col.Name == btypes.ColOp || col.Name == btypes.ColEpoch || col.Name == btypes.ColDeletedAt {
+		if isMetaColumn(col.Name) || opts.Omit[col.Name] {
 			continue
 		}
 		dataCols = append(dataCols, col)
@@ -42,20 +87,37 @@ func WriteBaseParquet(path string, rows []Row, columns []manifest.Column) error 
 
 // WriteDeltaParquet writes CDC delta rows with __op and __epoch columns.
 func WriteDeltaParquet(path string, rows []Row, columns []manifest.Column, epochNum int64) error {
+	return WriteDeltaParquetOpts(path, rows, columns, epochNum, DeltaOptions{})
+}
+
+// WriteDeltaParquetOpts is WriteDeltaParquet with column omission and control
+// over the __seq column.
+func WriteDeltaParquetOpts(path string, rows []Row, columns []manifest.Column, epochNum int64, opts DeltaOptions) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
 		return err
 	}
 
-	// Prepend __op and __epoch columns
 	allCols := []manifest.Column{
 		{Name: btypes.ColOp, PgType: "text", ParquetType: "UTF8", Nullable: false},
 		{Name: btypes.ColEpoch, PgType: "bigint", ParquetType: "INT64", Nullable: false},
 	}
-	allCols = append(allCols, columns...)
+	if !opts.NoSeq {
+		allCols = append(allCols, manifest.Column{Name: ColSeq, PgType: "bigint", ParquetType: "INT64", Nullable: false})
+	}
+	for _, col := range columns {
+		if opts.Omit[col.Name] {
+			continue
+		}
+		allCols = append(allCols, col)
+	}
 
-	// Inject __epoch into each row
 	for i := range rows {
 		rows[i][btypes.ColEpoch] = epochNum
+		if !opts.NoSeq {
+			if _, ok := rows[i][ColSeq]; !ok {
+				rows[i][ColSeq] = int64(i)
+			}
+		}
 	}
 
 	return writeParquetFile(path, rows, allCols)

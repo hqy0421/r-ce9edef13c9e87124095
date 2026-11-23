@@ -39,12 +39,24 @@ pg-cdc init --config pg-cdc.yml
 └── ...
 ```
 
+With [business-date partitioning](../2-streaming-and-storage/04-streaming.md#business-date-partitioning) enabled, the snapshot is bucketed by date and one base is written per partition:
+
+```
+├── public.orders/
+│   ├── order_date=2026-01-01/base/base_000000.parquet
+│   ├── order_date=2026-01-02/base/base_000000.parquet
+│   └── order_date=__HIVE_DEFAULT_PARTITION__/base/base_000000.parquet   # NULL date
+```
+
+The date column is omitted from the files and reconstructed from the directory when read with `hive_partitioning=true`.
+
 ## Manifest Content
 
 After init, `manifest.json` contains:
 
 - **Source**: PostgreSQL version, init LSN, timestamp
 - **Active tables**: status, primary keys, schema (column types), row count, path
+- **Partitions** (partitioned tables only): `partition` records the date column and every landing directory with its row count, e.g. `{"column":"order_date","partitions":[{"value":"2026-01-01","path":"public.orders/order_date=2026-01-01","rows":120},…]}`
 - **Excluded tables**: status=excluded, tags, reason (e.g., "policy:pii")
 - **Schemas**: column-level type information (pg_type + parquet_type)
 - **Roles**: per-role table + column access (if profiles configured)
@@ -73,6 +85,8 @@ pg-cdc init --config pg-cdc.yml         # create new slot + snapshot
 ## Catalog registration
 
 When `catalog.type: glue` is set in `pg-cdc.yml`, init registers active tables in the configured Glue database after snapshotting. Registration is idempotent — re-running init on an existing deployment updates existing table definitions rather than failing.
+
+For a partitioned table, the date column is declared as the Glue `PartitionKey` (and removed from the data columns), and each landing directory is registered as a partition — including `__HIVE_DEFAULT_PARTITION__` for `NULL` dates. Compaction re-syncs the partition list after every run; `pg-cdc catalog register` repairs it.
 
 > **Enabling Glue on a deployment that was already initialized?** Don't re-run `init` — it will re-snapshot every table from Postgres (duplicating GB of writes and requiring a slot teardown). Use **`pg-cdc catalog register`** instead: it reads the existing manifest and calls the same upsert path without touching Postgres. See the `catalog` subcommand in [`08-operations.md`](08-operations.md).
 

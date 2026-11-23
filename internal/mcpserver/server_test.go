@@ -16,24 +16,45 @@ import (
 	"github.com/burnside-project/pg-cdc-core/internal/config"
 )
 
-// fakeSink is a minimal ports.Sink for tests. Only ReadManifest and Backend
-// are exercised by the MCP server; the rest are no-ops.
+// fakeSink is a minimal ports.Sink for tests. ReadManifest and Backend are
+// served from the fixture; ListFiles walks the storage dir so the query tests
+// see the Parquet files they create. The rest are no-ops.
 type fakeSink struct {
-	m *manifest.Manifest
+	m        *manifest.Manifest
+	listRoot string
 }
 
-func (f *fakeSink) ReadManifest(context.Context) (*manifest.Manifest, error)  { return f.m, nil }
-func (f *fakeSink) WriteManifest(context.Context, *manifest.Manifest) error   { return nil }
-func (f *fakeSink) WriteFile(context.Context, string, io.Reader) error        { return nil }
-func (f *fakeSink) ReadFile(context.Context, string) (io.ReadCloser, error)   { return nil, nil }
-func (f *fakeSink) ListFiles(context.Context, string) ([]string, error)       { return nil, nil }
-func (f *fakeSink) DeleteFile(context.Context, string) error                  { return nil }
-func (f *fakeSink) Backend() string                                           { return "filesystem" }
+func (f *fakeSink) ReadManifest(context.Context) (*manifest.Manifest, error) { return f.m, nil }
+func (f *fakeSink) WriteManifest(context.Context, *manifest.Manifest) error  { return nil }
+func (f *fakeSink) WriteFile(context.Context, string, io.Reader) error       { return nil }
+func (f *fakeSink) ReadFile(context.Context, string) (io.ReadCloser, error)  { return nil, nil }
+func (f *fakeSink) DeleteFile(context.Context, string) error                 { return nil }
+func (f *fakeSink) Backend() string                                          { return "filesystem" }
+
+func (f *fakeSink) ListFiles(_ context.Context, prefix string) ([]string, error) {
+	if f.listRoot == "" {
+		return nil, nil
+	}
+	dir := filepath.Join(f.listRoot, filepath.FromSlash(prefix))
+	var files []string
+	err := filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
+		if err != nil || info.IsDir() {
+			return nil
+		}
+		rel, err := filepath.Rel(f.listRoot, path)
+		if err != nil {
+			return err
+		}
+		files = append(files, filepath.ToSlash(rel))
+		return nil
+	})
+	return files, err
+}
 
 func newTestServer(storagePath string) *server {
 	return &server{
 		cfg: config.Config{Storage: config.StorageConfig{Type: "filesystem", Path: storagePath}},
-		sink: &fakeSink{m: &manifest.Manifest{
+		sink: &fakeSink{listRoot: storagePath, m: &manifest.Manifest{
 			Version: 1,
 			Tables: map[string]manifest.Table{
 				"public.orders": {

@@ -47,10 +47,23 @@ Long-running daemon that consumes the replication slot, buffers events, and flus
 - [x] Per-table iceberg mutex serializes AppendRows / EvolveSchema / ExpireSnapshots
 - [x] Detailed phase docs in [`04-streaming.md`](04-streaming.md)
 
+### Business-date partitioning
+Opt-in Hive-style layout on a per-table business-date column, so a consumer can prune to a handful of dates without scanning the table — and an `UPDATE` that changes a row's date moves it cleanly. Configured under `partitions` (see [`02-configuration.md`](../1-getting-started/02-configuration.md#partitions)).
+- [x] `partitions.date_column` default + `partitions.tables` per-table override (`""` disables)
+- [x] One base/delta directory per date: `<table>/<col>=YYYY-MM-DD/{base,deltas}/…`
+- [x] NULL / unparseable dates land in the registered default partition `__HIVE_DEFAULT_PARTITION__`
+- [x] Date column omitted from Parquet and reconstructed from the path (`hive_partitioning=true`)
+- [x] `__seq` delta column orders same-epoch events so compaction applies a cross-date move deterministically
+- [x] Manifest `partition` records the actual landing directories + row counts
+- [x] Glue `PartitionKey` + per-partition registration (idempotent, re-synced by compaction)
+- [x] Details in [`04-streaming.md`](../2-streaming-and-storage/04-streaming.md#business-date-partitioning) and [`05-compaction.md`](../2-streaming-and-storage/05-compaction.md#business-date-partitioning-and-moves)
+
 ### Compaction
 Merges delta epochs into a new base snapshot, applies I/U/D semantics, expires soft-deletes on a configurable TTL.
 - [x] `pg-cdc compact` subcommand (also wired to a systemd timer — see Operability)
 - [x] Tombstone TTL (default 30 days, configurable)
+- [x] Global-by-PK index across partitions: a moved row leaves no active copy in its old date
+- [x] Self-healing generation GC; crash-safe (manifest before deletes)
 - [x] Iceberg snapshot expiration (default retain 100 per table)
 - [x] Manifest CAS-safe coexistence with the streaming daemon
 - [x] Compaction details in [`05-compaction.md`](05-compaction.md)
